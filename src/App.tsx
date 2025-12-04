@@ -6,10 +6,10 @@ import ImageConverter from "./components/ImageConverter";
 import VideoConverter from "./components/VideoConverter";
 import ErrorBoundary from "./components/ErrorBoundary";
 
-function App(): JSX.Element {
+function App() {
   const [activeTool, setActiveTool] = useState<string>("attendance");
 
-  const renderTool = (): JSX.Element => {
+  const renderTool = () => {
     switch (activeTool) {
       case "attendance":
         return <AttendanceModule />;
