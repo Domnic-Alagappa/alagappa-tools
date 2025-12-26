@@ -59,7 +59,13 @@ export default function DocumentConverter() {
   const [selectedSheet, setSelectedSheet] = useState<number>(0);
 
   // Active tab
-  const [activeTab, setActiveTab] = useState<"excel" | "data" | "pdf" | "external">("excel");
+  const [activeTab, setActiveTab] = useState<"excel" | "data" | "pdf" | "office" | "markdown" | "external">("excel");
+  
+  // Office conversion
+  const [officeFormat, setOfficeFormat] = useState<string>("pdf");
+  
+  // Pandoc conversion
+  const [pandocToFormat, setPandocToFormat] = useState<string>("html");
 
   // Check external tools on mount
   useEffect(() => {
@@ -265,6 +271,77 @@ export default function DocumentConverter() {
     }
   };
 
+  // ============================================================================
+  // External Tool Conversions (LibreOffice, Pandoc)
+  // ============================================================================
+
+  const handleOfficeConvert = async () => {
+    if (!inputFile) return;
+
+    // Get output directory from save dialog
+    const outputPath = await save({
+      defaultPath: inputFile.replace(/\.[^/.]+$/, `.${officeFormat}`),
+      filters: [{ name: `${officeFormat.toUpperCase()} Files`, extensions: [officeFormat] }],
+    });
+
+    if (!outputPath) return;
+
+    // Extract directory from the path
+    const outputDir = outputPath.substring(0, outputPath.lastIndexOf("/")) || outputPath.substring(0, outputPath.lastIndexOf("\\"));
+
+    setConverting(true);
+    setProgress(`Converting to ${officeFormat.toUpperCase()}...`);
+    setResult(null);
+    setError(null);
+
+    try {
+      const convResult = await invoke<ConversionResult>("document_convert_office", {
+        inputPath: inputFile,
+        outputFormat: officeFormat,
+        outputDir,
+      });
+      setResult(convResult);
+    } catch (err) {
+      setError(`Conversion failed: ${err}`);
+    } finally {
+      setConverting(false);
+      setProgress("");
+    }
+  };
+
+  const handlePandocConvert = async () => {
+    if (!inputFile) return;
+
+    const ext = pandocToFormat === "html" ? "html" : pandocToFormat === "pdf" ? "pdf" : pandocToFormat === "docx" ? "docx" : "txt";
+    const defaultName = inputFile.replace(/\.[^/.]+$/, `.${ext}`);
+    
+    const outputPath = await save({
+      defaultPath: defaultName,
+      filters: [{ name: `${ext.toUpperCase()} Files`, extensions: [ext] }],
+    });
+
+    if (!outputPath) return;
+
+    setConverting(true);
+    setProgress(`Converting with Pandoc...`);
+    setResult(null);
+    setError(null);
+
+    try {
+      const convResult = await invoke<ConversionResult>("document_convert_pandoc", {
+        inputPath: inputFile,
+        outputPath,
+        toFormat: pandocToFormat,
+      });
+      setResult(convResult);
+    } catch (err) {
+      setError(`Conversion failed: ${err}`);
+    } finally {
+      setConverting(false);
+      setProgress("");
+    }
+  };
+
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
@@ -287,7 +364,7 @@ export default function DocumentConverter() {
 
         {/* Tabs */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
-          <div className="flex border-b border-gray-200 mb-6">
+          <div className="flex flex-wrap border-b border-gray-200 mb-6">
             <button
               onClick={() => { setActiveTab("excel"); clearState(); }}
               className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
@@ -318,15 +395,39 @@ export default function DocumentConverter() {
             >
               📕 Merge PDFs
             </button>
+            {hasTool("LibreOffice") && (
+              <button
+                onClick={() => { setActiveTab("office"); clearState(); }}
+                className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                  activeTab === "office"
+                    ? "border-orange-500 text-orange-600"
+                    : "border-transparent text-gray-500 hover:text-gray-700"
+                }`}
+              >
+                📘 Office → PDF
+              </button>
+            )}
+            {hasTool("Pandoc") && (
+              <button
+                onClick={() => { setActiveTab("markdown"); clearState(); }}
+                className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                  activeTab === "markdown"
+                    ? "border-purple-500 text-purple-600"
+                    : "border-transparent text-gray-500 hover:text-gray-700"
+                }`}
+              >
+                📝 Markdown
+              </button>
+            )}
             <button
               onClick={() => { setActiveTab("external"); clearState(); }}
               className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
                 activeTab === "external"
-                  ? "border-purple-500 text-purple-600"
+                  ? "border-gray-500 text-gray-600"
                   : "border-transparent text-gray-500 hover:text-gray-700"
               }`}
             >
-              ⚙️ Advanced
+              ⚙️ Tools
             </button>
           </div>
 
@@ -490,6 +591,126 @@ export default function DocumentConverter() {
             </div>
           )}
 
+          {/* Office Tab (LibreOffice) */}
+          {activeTab === "office" && (
+            <div className="space-y-4">
+              <button
+                onClick={() => selectInputFile(["doc", "docx", "odt", "xls", "xlsx", "ods", "ppt", "pptx", "odp"])}
+                disabled={converting}
+                className="w-full p-6 border-2 border-dashed border-gray-300 rounded-lg hover:border-orange-400 hover:bg-orange-50 transition-colors disabled:opacity-50"
+              >
+                <div className="text-center">
+                  <span className="text-4xl">📘</span>
+                  <p className="text-gray-600 font-medium mt-2">Select Office Document</p>
+                  <p className="text-sm text-gray-400">Word, Excel, PowerPoint</p>
+                </div>
+              </button>
+
+              {docInfo && (
+                <div className="p-4 bg-gray-50 rounded-lg space-y-4">
+                  <div className="flex items-center gap-3">
+                    <span className="text-2xl">{getFileIcon(docInfo.extension)}</span>
+                    <div>
+                      <p className="font-medium text-gray-900">{docInfo.file_name}</p>
+                      <p className="text-sm text-gray-500">{formatFileSize(docInfo.file_size)}</p>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Convert to</label>
+                    <select
+                      value={officeFormat}
+                      onChange={(e) => setOfficeFormat(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                    >
+                      <option value="pdf">PDF</option>
+                      <option value="html">HTML</option>
+                      <option value="txt">Plain Text</option>
+                      {(docInfo.extension === "doc" || docInfo.extension === "docx" || docInfo.extension === "odt") && (
+                        <>
+                          <option value="docx">Word (.docx)</option>
+                          <option value="odt">OpenDocument (.odt)</option>
+                        </>
+                      )}
+                      {(docInfo.extension === "xls" || docInfo.extension === "xlsx" || docInfo.extension === "ods") && (
+                        <>
+                          <option value="xlsx">Excel (.xlsx)</option>
+                          <option value="csv">CSV</option>
+                        </>
+                      )}
+                    </select>
+                  </div>
+
+                  <button
+                    onClick={handleOfficeConvert}
+                    disabled={converting}
+                    className="w-full py-2.5 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50 transition-colors font-medium"
+                  >
+                    {converting ? "Converting..." : `Convert to ${officeFormat.toUpperCase()}`}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Markdown Tab (Pandoc) */}
+          {activeTab === "markdown" && (
+            <div className="space-y-4">
+              <button
+                onClick={() => selectInputFile(["md", "markdown", "txt", "html", "rst", "tex"])}
+                disabled={converting}
+                className="w-full p-6 border-2 border-dashed border-gray-300 rounded-lg hover:border-purple-400 hover:bg-purple-50 transition-colors disabled:opacity-50"
+              >
+                <div className="text-center">
+                  <span className="text-4xl">📝</span>
+                  <p className="text-gray-600 font-medium mt-2">Select Text Document</p>
+                  <p className="text-sm text-gray-400">Markdown, HTML, TXT, RST, LaTeX</p>
+                </div>
+              </button>
+
+              {docInfo && (
+                <div className="p-4 bg-gray-50 rounded-lg space-y-4">
+                  <div className="flex items-center gap-3">
+                    <span className="text-2xl">{getFileIcon(docInfo.extension)}</span>
+                    <div>
+                      <p className="font-medium text-gray-900">{docInfo.file_name}</p>
+                      <p className="text-sm text-gray-500">{formatFileSize(docInfo.file_size)}</p>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Convert to</label>
+                    <select
+                      value={pandocToFormat}
+                      onChange={(e) => setPandocToFormat(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                    >
+                      <option value="html">HTML</option>
+                      <option value="pdf">PDF (requires LaTeX)</option>
+                      <option value="docx">Word (.docx)</option>
+                      <option value="markdown">Markdown</option>
+                      <option value="plain">Plain Text</option>
+                      <option value="rst">reStructuredText</option>
+                      <option value="latex">LaTeX</option>
+                    </select>
+                  </div>
+
+                  <button
+                    onClick={handlePandocConvert}
+                    disabled={converting}
+                    className="w-full py-2.5 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-colors font-medium"
+                  >
+                    {converting ? "Converting..." : `Convert with Pandoc`}
+                  </button>
+                </div>
+              )}
+
+              <div className="text-xs text-gray-500 p-3 bg-gray-50 rounded-lg">
+                <strong>Supported conversions:</strong> Markdown ↔ HTML ↔ Word ↔ LaTeX ↔ Plain Text
+              </div>
+            </div>
+          )}
+
           {/* External Tools Tab */}
           {activeTab === "external" && (
             <div className="space-y-4">
@@ -512,20 +733,50 @@ export default function DocumentConverter() {
               </div>
 
               <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                <h4 className="font-medium text-blue-800 mb-2">Advanced Conversions</h4>
-                <p className="text-sm text-blue-700">
-                  For Office document conversions (Word, PowerPoint to PDF), install:
+                <h4 className="font-medium text-blue-800 mb-2">📦 Installation (Optional)</h4>
+                <p className="text-sm text-blue-700 mb-3">
+                  For advanced document conversions (Word, PowerPoint → PDF):
                 </p>
-                <ul className="text-sm text-blue-600 mt-2 space-y-1">
-                  <li>• <code className="bg-blue-100 px-1 rounded">brew install --cask libreoffice</code></li>
-                  <li>• <code className="bg-blue-100 px-1 rounded">brew install pandoc</code> (for Markdown)</li>
-                </ul>
+                
+                {/* macOS */}
+                <div className="mb-3">
+                  <span className="text-xs font-semibold text-blue-800 bg-blue-100 px-2 py-0.5 rounded">🍎 macOS</span>
+                  <ul className="text-sm text-blue-600 mt-1 space-y-1 ml-2">
+                    <li><code className="bg-blue-100 px-1 rounded text-xs">brew install --cask libreoffice</code></li>
+                    <li><code className="bg-blue-100 px-1 rounded text-xs">brew install pandoc</code></li>
+                  </ul>
+                </div>
+
+                {/* Windows */}
+                <div className="mb-3">
+                  <span className="text-xs font-semibold text-blue-800 bg-blue-100 px-2 py-0.5 rounded">🪟 Windows</span>
+                  <ul className="text-sm text-blue-600 mt-1 space-y-1 ml-2">
+                    <li>Download from <a href="https://www.libreoffice.org" target="_blank" rel="noopener" className="underline">libreoffice.org</a></li>
+                    <li><code className="bg-blue-100 px-1 rounded text-xs">winget install Pandoc</code> or <a href="https://pandoc.org" target="_blank" rel="noopener" className="underline">pandoc.org</a></li>
+                  </ul>
+                </div>
+
+                {/* Linux */}
+                <div>
+                  <span className="text-xs font-semibold text-blue-800 bg-blue-100 px-2 py-0.5 rounded">🐧 Linux</span>
+                  <ul className="text-sm text-blue-600 mt-1 space-y-1 ml-2">
+                    <li><code className="bg-blue-100 px-1 rounded text-xs">sudo apt install libreoffice pandoc</code></li>
+                  </ul>
+                </div>
               </div>
 
               {hasTool("LibreOffice") && (
-                <div className="p-4 border border-gray-200 rounded-lg">
-                  <p className="text-sm text-gray-600">
-                    LibreOffice detected! Office document conversions are available through the command line.
+                <div className="p-4 border border-green-200 bg-green-50 rounded-lg">
+                  <p className="text-sm text-green-700">
+                    ✅ <strong>LibreOffice detected!</strong> You can convert Word, Excel, and PowerPoint files.
+                  </p>
+                </div>
+              )}
+
+              {hasTool("Pandoc") && (
+                <div className="p-4 border border-green-200 bg-green-50 rounded-lg">
+                  <p className="text-sm text-green-700">
+                    ✅ <strong>Pandoc detected!</strong> You can convert Markdown, HTML, and text documents.
                   </p>
                 </div>
               )}
