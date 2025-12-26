@@ -1121,17 +1121,27 @@ pub async fn connect_and_fetch_attendance(
 /// Used during network scanning
 pub async fn get_device_info_quick(ip: &str, port: u16) -> Option<DeviceInfo> {
     let ip = ip.to_string();
+    let ip_for_log = ip.clone();
+    let port_copy = port;
     
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         // Quick connect with shorter timeout
-        let addr = format!("{}:{}", ip, port);
-        let stream = std::net::TcpStream::connect_timeout(
-            &addr.parse().ok()?,
-            std::time::Duration::from_secs(3)
-        ).ok()?;
+        let addr = format!("{}:{}", ip, port_copy);
+        info!("🔌 Fetching device info from {}", addr);
         
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
+        let stream = match std::net::TcpStream::connect_timeout(
+            &addr.parse().ok()?,
+            std::time::Duration::from_secs(5)
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("❌ Quick connect failed {}: {}", addr, e);
+                return None;
+            }
+        };
+        
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
         
         let mut client = ZKClient {
             stream,
@@ -1140,18 +1150,32 @@ pub async fn get_device_info_quick(ip: &str, port: u16) -> Option<DeviceInfo> {
         };
         
         // Try to handshake
-        if client.do_handshake().is_err() {
+        if let Err(e) = client.do_handshake() {
+            warn!("❌ Quick handshake failed {}: {}", ip, e);
             return None;
         }
         
         // Get device info
         let device_info = client.get_device_info();
         
+        info!("📟 Scan: {} = {} (S/N: {})", 
+            ip,
+            if device_info.device_name.is_empty() { "Unknown" } else { &device_info.device_name },
+            if device_info.serial_number.is_empty() { "-" } else { &device_info.serial_number }
+        );
+        
         // Disconnect
         let _ = client.disconnect();
         
         Some(device_info)
     })
-    .await
-    .ok()?
+    .await;
+    
+    match result {
+        Ok(info) => info,
+        Err(e) => {
+            warn!("❌ spawn_blocking failed for {}: {}", ip_for_log, e);
+            None
+        }
+    }
 }

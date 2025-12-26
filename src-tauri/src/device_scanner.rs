@@ -59,30 +59,42 @@ async fn check_port(ip: &str, port: u16, timeout_ms: u64) -> bool {
 
 /// Check if IP has biometric port open (fast check)
 async fn check_biometric_ip(ip: String, semaphore: Arc<Semaphore>) -> Option<BiometricDevice> {
-    let _permit = semaphore.acquire().await.ok()?;
+    // Only hold semaphore during port checking
+    let main_port: Option<u16>;
+    let mut open_ports: Vec<u16>;
     
-    // Check all ZKTeco ports to find the main one
-    let mut main_port: Option<u16> = None;
-    for port in ZKTECO_PORTS {
-        if check_port(&ip, *port, 300).await {
-            main_port = Some(*port);
-            break;
+    {
+        let _permit = semaphore.acquire().await.ok()?;
+        
+        // Check all ZKTeco ports to find the main one
+        main_port = {
+            let mut found = None;
+            for port in ZKTECO_PORTS {
+                if check_port(&ip, *port, 500).await {
+                    found = Some(*port);
+                    break;
+                }
+            }
+            found
+        };
+        
+        if main_port.is_none() {
+            return None;
         }
-    }
-    
-    if let Some(port) = main_port {
-        let mut open_ports = vec![port];
+        
+        let port = main_port.unwrap();
+        open_ports = vec![port];
         
         // Check all other ZKTeco ports
         for p in ZKTECO_PORTS {
-            if *p != port && check_port(&ip, *p, 200).await {
+            if *p != port && check_port(&ip, *p, 300).await {
                 open_ports.push(*p);
             }
         }
         
         // Check web/service ports
         for p in OTHER_PORTS {
-            if check_port(&ip, *p, 200).await {
+            if check_port(&ip, *p, 300).await {
                 open_ports.push(*p);
             }
         }
@@ -90,20 +102,22 @@ async fn check_biometric_ip(ip: String, semaphore: Arc<Semaphore>) -> Option<Bio
         // Sort ports for consistent display
         open_ports.sort();
         
-        // Fetch device info
-        let device_info = get_device_info_quick(&ip, port).await;
-        
-        return Some(BiometricDevice {
-            ip,
-            mac: "Unknown".to_string(),
-            open_ports,
-            device_name: device_info.as_ref().map(|d| d.device_name.clone()).filter(|s| !s.is_empty()),
-            firmware_version: device_info.as_ref().map(|d| d.firmware_version.clone()).filter(|s| !s.is_empty()),
-            serial_number: device_info.as_ref().map(|d| d.serial_number.clone()).filter(|s| !s.is_empty()),
-        });
+        // Permit is released here
     }
     
-    None
+    // Fetch device info (without holding semaphore - gives device time to respond)
+    let port = main_port.unwrap();
+    info!("🔍 Device found at {}, fetching info on port {}...", ip, port);
+    let device_info = get_device_info_quick(&ip, port).await;
+    
+    Some(BiometricDevice {
+        ip,
+        mac: "Unknown".to_string(),
+        open_ports,
+        device_name: device_info.as_ref().map(|d| d.device_name.clone()).filter(|s| !s.is_empty()),
+        firmware_version: device_info.as_ref().map(|d| d.firmware_version.clone()).filter(|s| !s.is_empty()),
+        serial_number: device_info.as_ref().map(|d| d.serial_number.clone()).filter(|s| !s.is_empty()),
+    })
 }
 
 // Common subnets to scan (in addition to local subnet)

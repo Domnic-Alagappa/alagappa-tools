@@ -263,7 +263,7 @@ function calculateDailySummary(records: AttendanceRecord[]): DailySummary[] {
 export default function AttendanceModule() {
   const [devices, setDevices] = useState<BiometricDevice[]>(() => loadDevicesFromStorage());
   const [scanning, setScanning] = useState(false);
-  const [selectedDevice, setSelectedDevice] = useState<BiometricDevice | null>(null);
+  const [selectedDevices, setSelectedDevices] = useState<BiometricDevice[]>([]);
   const [attendanceData, setAttendanceData] = useState<AttendanceRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -485,7 +485,6 @@ export default function AttendanceModule() {
   };
   
   // Remove a device from the list
-  // Remove device by serial number (or IP if no serial)
   const removeDevice = (device: BiometricDevice): void => {
     setDevices(prev => prev.filter(d => {
       if (device.serial_number && d.serial_number) {
@@ -494,36 +493,65 @@ export default function AttendanceModule() {
       return d.ip !== device.ip;
     }));
     
-    // Clear selection if removed device was selected
-    if (selectedDevice) {
-      const isSame = device.serial_number 
-        ? selectedDevice.serial_number === device.serial_number
-        : selectedDevice.ip === device.ip;
-      if (isSame) {
-        setSelectedDevice(null);
-        setAttendanceData([]);
+    // Also remove from selection if selected
+    setSelectedDevices(prev => prev.filter(d => {
+      if (device.serial_number && d.serial_number) {
+        return d.serial_number !== device.serial_number;
       }
-    }
+      return d.ip !== device.ip;
+    }));
   };
   
-  // Select a device
-  const selectDevice = (device: BiometricDevice): void => {
-    setSelectedDevice(device);
+  // Helper to check if device is selected
+  const isDeviceSelected = (device: BiometricDevice): boolean => {
+    return selectedDevices.some(d => 
+      device.serial_number && d.serial_number 
+        ? d.serial_number === device.serial_number 
+        : d.ip === device.ip
+    );
+  };
+
+  // Toggle device selection (click to select/deselect)
+  const toggleDeviceSelection = (device: BiometricDevice): void => {
     setError(null);
     
-    // Load saved attendance data for this device
-    const savedData = loadAttendanceFromStorage(device);
-    setAttendanceData(savedData);
+    if (isDeviceSelected(device)) {
+      // Deselect
+      setSelectedDevices(prev => prev.filter(d => 
+        device.serial_number && d.serial_number 
+          ? d.serial_number !== device.serial_number 
+          : d.ip !== device.ip
+      ));
+    } else {
+      // Select (add to selection)
+      setSelectedDevices(prev => [...prev, device]);
+    }
     
     // Reset pagination
     setCurrentPage(1);
     setSummaryPage(1);
   };
 
-  // Sync (fetch attendance) from selected device
-  const syncDevice = async (): Promise<void> => {
-    if (!selectedDevice) {
-      setError("Please select a device first");
+  // Load attendance data for all selected devices
+  const loadSelectedDevicesData = (): void => {
+    const allData: AttendanceRecord[] = [];
+    for (const device of selectedDevices) {
+      const deviceData = loadAttendanceFromStorage(device);
+      allData.push(...deviceData);
+    }
+    setAttendanceData(allData);
+  };
+
+  // Effect to load data when selection changes
+  useEffect(() => {
+    loadSelectedDevicesData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDevices]);
+
+  // Sync (fetch attendance) from all selected devices
+  const syncDevices = async (): Promise<void> => {
+    if (selectedDevices.length === 0) {
+      setError("Please select at least one device");
       return;
     }
     
@@ -532,57 +560,90 @@ export default function AttendanceModule() {
     setCurrentPage(1);
     setSummaryPage(1);
     setConnectedDeviceInfo(null);
-    setLoadingProgress("Connecting to device...");
     
-    const port: number = selectedDevice.open_ports.includes(4370) 
-      ? 4370 
-      : selectedDevice.open_ports[0] ?? 4370;
+    const allRecords: AttendanceRecord[] = [];
+    const errors: string[] = [];
+    let lastDeviceInfo: DeviceInfo | null = null;
     
-    try {
-      setLoadingProgress("Fetching attendance data (this may take 30-60 seconds for large datasets)...");
-      const result = await safeInvoke<AttendanceResponse>("fetch_attendance", {
-        ip: selectedDevice.ip,
-        port: port,
-      });
+    for (const device of selectedDevices) {
+      const deviceIndex = selectedDevices.indexOf(device);
+      setLoadingProgress(`Syncing device ${deviceIndex + 1}/${selectedDevices.length}: ${device.serial_number || device.ip}...`);
       
-      // Store device info
-      setConnectedDeviceInfo(result.device_info);
+      const port: number = device.open_ports.includes(4370) 
+        ? 4370 
+        : device.open_ports[0] ?? 4370;
       
-      // Update device in list with device info
-      setDevices(prev => prev.map(d => 
-        d.ip === selectedDevice.ip 
-          ? {
-              ...d,
-              device_name: result.device_info.device_name || d.device_name,
-              firmware_version: result.device_info.firmware_version || d.firmware_version,
-              serial_number: result.device_info.serial_number || d.serial_number,
-              last_synced: new Date().toISOString(),
-            }
-          : d
-      ));
-      
-      setLoadingProgress(`Processing ${result.records.length} records...`);
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      setAttendanceData(result.records);
-      
-      // Save attendance data to localStorage (use updated device with serial)
-      const updatedDevice = { ...selectedDevice, serial_number: result.device_info.serial_number };
-      saveAttendanceToStorage(updatedDevice, result.records);
-    } catch (err: unknown) {
-      const errorMessage: string = err instanceof Error 
-        ? err.message 
-        : typeof err === 'string' 
-        ? err 
-        : 'Unknown error occurred';
-      setError(errorMessage);
-      console.error("Fetch error:", err);
-      setAttendanceData([]);
-      setConnectedDeviceInfo(null);
-    } finally {
-      setLoading(false);
-      setLoadingProgress("");
+      try {
+        const result = await safeInvoke<AttendanceResponse>("fetch_attendance", {
+          ip: device.ip,
+          port: port,
+        });
+        
+        // Store last device info (or could show all)
+        lastDeviceInfo = result.device_info;
+        
+        const deviceIp = device.ip;
+        const deviceSerial = device.serial_number;
+        
+        // Update device in list with device info
+        setDevices(prev => prev.map(d => {
+          const isSame = deviceSerial && d.serial_number 
+            ? d.serial_number === deviceSerial 
+            : d.ip === deviceIp;
+          return isSame 
+            ? {
+                ...d,
+                device_name: result.device_info.device_name || d.device_name,
+                firmware_version: result.device_info.firmware_version || d.firmware_version,
+                serial_number: result.device_info.serial_number || d.serial_number,
+                last_synced: new Date().toISOString(),
+              }
+            : d;
+        }));
+        
+        // Also update selectedDevices with new serial number
+        setSelectedDevices(prev => prev.map(d => {
+          const isSame = deviceSerial && d.serial_number 
+            ? d.serial_number === deviceSerial 
+            : d.ip === deviceIp;
+          return isSame 
+            ? { ...d, serial_number: result.device_info.serial_number || d.serial_number }
+            : d;
+        }));
+        
+        // Save to storage
+        const updatedDevice: BiometricDevice = { 
+          ...device, 
+          serial_number: result.device_info.serial_number || device.serial_number 
+        };
+        saveAttendanceToStorage(updatedDevice, result.records);
+        
+        // Add to combined records
+        allRecords.push(...result.records);
+        
+      } catch (err: unknown) {
+        const errorMessage: string = err instanceof Error 
+          ? err.message 
+          : typeof err === 'string' 
+          ? err 
+          : 'Unknown error occurred';
+        errors.push(`${device.serial_number || device.ip}: ${errorMessage}`);
+        console.error("Fetch error for device:", device.ip, err);
+      }
     }
+    
+    setLoadingProgress(`Processing ${allRecords.length} total records...`);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    setAttendanceData(allRecords);
+    setConnectedDeviceInfo(lastDeviceInfo);
+    
+    if (errors.length > 0) {
+      setError(`Errors: ${errors.join("; ")}`);
+    }
+    
+    setLoading(false);
+    setLoadingProgress("");
   };
 
   // Helper function to download CSV using Tauri native dialog
@@ -627,7 +688,11 @@ export default function AttendanceModule() {
       ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
     ].join("\n");
 
-    const filename = `attendance_raw_${selectedDevice?.serial_number || selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
+    const firstDevice = selectedDevices[0];
+    const deviceLabel = selectedDevices.length === 1 && firstDevice
+      ? (firstDevice.serial_number || firstDevice.ip) 
+      : selectedDevices.length > 1 ? `${selectedDevices.length}_devices` : 'export';
+    const filename = `attendance_raw_${deviceLabel}_${new Date().toISOString().split("T")[0]}.csv`;
     await downloadCSV(csvContent, filename);
   };
   
@@ -654,7 +719,11 @@ export default function AttendanceModule() {
       ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
     ].join("\n");
 
-    const filename = `attendance_summary_${selectedDevice?.serial_number || selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
+    const firstDevice = selectedDevices[0];
+    const deviceLabel = selectedDevices.length === 1 && firstDevice
+      ? (firstDevice.serial_number || firstDevice.ip) 
+      : selectedDevices.length > 1 ? `${selectedDevices.length}_devices` : 'export';
+    const filename = `attendance_summary_${deviceLabel}_${new Date().toISOString().split("T")[0]}.csv`;
     await downloadCSV(csvContent, filename);
   };
   
@@ -761,15 +830,11 @@ export default function AttendanceModule() {
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {devices.map((device) => {
                 const deviceKey = device.serial_number || device.ip;
-                const isSelected = selectedDevice 
-                  ? (device.serial_number && selectedDevice.serial_number 
-                      ? device.serial_number === selectedDevice.serial_number 
-                      : device.ip === selectedDevice.ip)
-                  : false;
+                const isSelected = isDeviceSelected(device);
                 return (
                   <div
                     key={deviceKey}
-                    onClick={() => selectDevice(device)}
+                    onClick={() => toggleDeviceSelection(device)}
                     className={`relative p-4 rounded-lg border-2 cursor-pointer transition-all ${
                       isSelected
                         ? "border-primary-500 bg-primary-50"
@@ -837,35 +902,48 @@ export default function AttendanceModule() {
           )}
           
           {/* Sync Button */}
-          {selectedDevice && (
+          {selectedDevices.length > 0 && (
             <div className="mt-4 pt-4 border-t border-gray-200 flex items-center justify-between">
               <div className="text-sm text-gray-600">
-                Selected: <span className="font-medium font-mono text-primary-600">{selectedDevice.serial_number || selectedDevice.ip}</span>
-                {selectedDevice.serial_number && <span className="text-gray-400 ml-2">({selectedDevice.ip})</span>}
-              </div>
-              <button
-                onClick={syncDevice}
-                disabled={loading}
-                className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-                type="button"
-              >
-                {loading ? (
-                  <>
-                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                    Syncing...
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                    </svg>
-                    Sync Attendance
-                  </>
+                Selected: <span className="font-medium text-primary-600">{selectedDevices.length} device{selectedDevices.length !== 1 ? 's' : ''}</span>
+                {selectedDevices.length <= 3 && (
+                  <span className="text-gray-400 ml-2">
+                    ({selectedDevices.map(d => d.serial_number || d.ip).join(", ")})
+                  </span>
                 )}
-              </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setSelectedDevices([])}
+                  className="px-3 py-2 text-gray-600 hover:text-gray-800 transition-colors text-sm"
+                  type="button"
+                >
+                  Clear Selection
+                </button>
+                <button
+                  onClick={syncDevices}
+                  disabled={loading}
+                  className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                  type="button"
+                >
+                  {loading ? (
+                    <>
+                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                      </svg>
+                      Syncing...
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      </svg>
+                      Sync Attendance
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -925,15 +1003,20 @@ export default function AttendanceModule() {
         )}
 
         {/* Attendance Data Section */}
-        {(selectedDevice || attendanceData.length > 0) && (
+        {(selectedDevices.length > 0 || attendanceData.length > 0) && (
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h3 className="text-lg font-semibold text-gray-800">Attendance Data</h3>
-                {selectedDevice && (
+                {selectedDevices.length > 0 && (
                   <div className="text-sm text-gray-600 mt-1 space-y-1">
                     <p>
-                      Device: <span className="font-mono text-primary-600">{selectedDevice.serial_number || selectedDevice.ip}</span> | Raw Records: {attendanceData.length.toLocaleString()} | Daily Summary: {dailySummary.length.toLocaleString()}
+                      {selectedDevices.length === 1 && selectedDevices[0] ? (
+                        <>Device: <span className="font-mono text-primary-600">{selectedDevices[0].serial_number || selectedDevices[0].ip}</span></>
+                      ) : (
+                        <>{selectedDevices.length} devices selected</>
+                      )}
+                      {" | "}Raw Records: {attendanceData.length.toLocaleString()} | Daily Summary: {dailySummary.length.toLocaleString()}
                     </p>
                     {dateRange && (
                       <p className="flex items-center gap-2">
