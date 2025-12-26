@@ -4,6 +4,7 @@ import AttendanceModule from "./components/AttendanceModule";
 import DocumentConverter from "./components/DocumentConverter";
 import ImageConverter from "./components/ImageConverter";
 import VideoConverter from "./components/VideoConverter";
+import AlagappaAI from "./components/AlagappaAI";
 import ErrorBoundary from "./components/ErrorBoundary";
 
 function App() {
@@ -19,6 +20,8 @@ function App() {
         return <ImageConverter />;
       case "video":
         return <VideoConverter />;
+      case "ai":
+        return <AlagappaAI />;
       default:
         return <AttendanceModule />;
     }

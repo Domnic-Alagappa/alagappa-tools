@@ -17,6 +17,11 @@ export default function Layout({ children, activeTool, onToolChange }: LayoutPro
 
   const menuItems: MenuItem[] = [
     {
+      id: "ai",
+      name: "Alagappa AI",
+      icon: "🤖",
+    },
+    {
       id: "attendance",
       name: "Attendance",
       icon: "📊",

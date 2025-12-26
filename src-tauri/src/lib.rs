@@ -4,6 +4,7 @@ mod video_converter;
 mod media_converter;
 mod document_converter;
 mod bundled_converter;
+mod ai_assistant;
 
 use device_scanner::{scan_network, BiometricDevice};
 use zkteco_client::{connect_and_fetch_attendance, AttendanceResponse};
@@ -11,6 +12,7 @@ use media_converter::{
     VideoConvertOptions, ImageConvertOptions, ConversionResult, MediaInfo,
 };
 use document_converter::ToolStatus;
+use ai_assistant::{AIProvider, ChatRequest, ChatResponse};
 
 // ============================================================================
 // Attendance Commands
@@ -187,6 +189,28 @@ fn bundled_resize_image(
 }
 
 // ============================================================================
+// AI Assistant Commands
+// ============================================================================
+
+#[tauri::command]
+fn ai_get_providers() -> Vec<AIProvider> {
+    ai_assistant::get_providers()
+}
+
+#[tauri::command]
+async fn ai_chat(
+    request: ChatRequest,
+    api_key: Option<String>,
+) -> Result<ChatResponse, String> {
+    ai_assistant::chat(request, api_key).await
+}
+
+#[tauri::command]
+fn ai_get_system_prompt() -> String {
+    ai_assistant::get_system_prompt()
+}
+
+// ============================================================================
 // App Entry Point
 // ============================================================================
 
@@ -229,6 +253,10 @@ pub fn run() {
             bundled_json_to_csv,
             bundled_convert_image,
             bundled_resize_image,
+            // AI Assistant
+            ai_get_providers,
+            ai_chat,
+            ai_get_system_prompt,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
