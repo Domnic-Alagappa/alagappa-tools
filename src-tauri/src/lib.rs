@@ -3,7 +3,7 @@ mod zkteco_client;
 mod video_converter;
 
 use device_scanner::{scan_network, BiometricDevice};
-use zkteco_client::{connect_and_fetch_attendance, AttendanceRecord};
+use zkteco_client::{connect_and_fetch_attendance, AttendanceResponse};
 use video_converter::{
     check_ffmpeg_available, convert_video, compress_video, extract_audio, get_video_info,
     VideoConversionOptions,
@@ -18,7 +18,7 @@ async fn scan_for_devices() -> Result<Vec<BiometricDevice>, String> {
 async fn fetch_attendance(
     ip: String,
     port: u16,
-) -> Result<Vec<AttendanceRecord>, String> {
+) -> Result<AttendanceResponse, String> {
     connect_and_fetch_attendance(&ip, port).await
 }
 

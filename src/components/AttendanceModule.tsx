@@ -1,12 +1,42 @@
-import { useState, useRef, useMemo } from "react";
+import { useState, useRef, useMemo, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+
+const STORAGE_KEY = "biometric_devices";
 
 interface BiometricDevice {
   ip: string;
   mac: string;
   open_ports: number[];
+  // Device info (populated after first sync)
+  device_name?: string;
+  firmware_version?: string;
+  serial_number?: string;
+  last_synced?: string;
 }
 
+// Load devices from localStorage
+function loadDevicesFromStorage(): BiometricDevice[] {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (e) {
+    console.error("Failed to load devices from storage:", e);
+  }
+  return [];
+}
+
+// Save devices to localStorage
+function saveDevicesToStorage(devices: BiometricDevice[]): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(devices));
+  } catch (e) {
+    console.error("Failed to save devices to storage:", e);
+  }
+}
+
+// Raw record from device (no event calculation)
 interface AttendanceRecord {
   user_id: number;
   user_name: string;
@@ -15,7 +45,32 @@ interface AttendanceRecord {
   punch: number;
   date: string;
   time: string;
-  event: string;
+}
+
+// Calculated summary per user per day
+interface DailySummary {
+  user_id: number;
+  user_name: string;
+  date: string;
+  first_punch: string;  // First punch time (Check In)
+  last_punch: string;   // Last punch time (Check Out)
+  total_punches: number;
+  working_hours: string; // Calculated duration
+}
+
+// Device information from ZKTeco device
+interface DeviceInfo {
+  device_name: string;
+  firmware_version: string;
+  serial_number: string;
+  platform: string;
+  mac_address: string;
+}
+
+// Response from fetch_attendance command
+interface AttendanceResponse {
+  device_info: DeviceInfo;
+  records: AttendanceRecord[];
 }
 
 
@@ -47,34 +102,191 @@ async function safeInvoke<T>(cmd: string, args?: any): Promise<T> {
 // Pagination constants
 const RECORDS_PER_PAGE = 100;
 
+// Calculate daily summary from raw attendance records
+function calculateDailySummary(records: AttendanceRecord[]): DailySummary[] {
+  // Group records by user_id + date
+  const grouped = new Map<string, AttendanceRecord[]>();
+  
+  for (const record of records) {
+    const key = `${record.user_id}_${record.date}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.push(record);
+    } else {
+      grouped.set(key, [record]);
+    }
+  }
+  
+  // Calculate summary for each group
+  const summaries: DailySummary[] = [];
+  
+  grouped.forEach((dayRecords) => {
+    if (dayRecords.length === 0) return;
+    
+    // Sort by time
+    dayRecords.sort((a, b) => a.time.localeCompare(b.time));
+    
+    const firstRecord = dayRecords[0];
+    const lastRecord = dayRecords[dayRecords.length - 1];
+    
+    // Calculate working hours if there are at least 2 punches
+    let workingHours = "-";
+    if (dayRecords.length >= 2 && firstRecord && lastRecord) {
+      const firstTimeParts = firstRecord.time.split(":");
+      const lastTimeParts = lastRecord.time.split(":");
+      
+      const firstMinutes = parseInt(firstTimeParts[0] || "0") * 60 + parseInt(firstTimeParts[1] || "0");
+      const lastMinutes = parseInt(lastTimeParts[0] || "0") * 60 + parseInt(lastTimeParts[1] || "0");
+      
+      const diffMinutes = lastMinutes - firstMinutes;
+      if (diffMinutes > 0) {
+        const hours = Math.floor(diffMinutes / 60);
+        const mins = diffMinutes % 60;
+        workingHours = `${hours}h ${mins}m`;
+      }
+    }
+    
+    if (firstRecord && lastRecord) {
+      summaries.push({
+        user_id: firstRecord.user_id,
+        user_name: firstRecord.user_name,
+        date: firstRecord.date,
+        first_punch: firstRecord.time,
+        last_punch: lastRecord.time,
+        total_punches: dayRecords.length,
+        working_hours: workingHours,
+      });
+    }
+  });
+  
+  // Sort by date (newest first), then by user
+  summaries.sort((a, b) => {
+    const dateCompare = b.date.localeCompare(a.date);
+    if (dateCompare !== 0) return dateCompare;
+    return a.user_name.localeCompare(b.user_name);
+  });
+  
+  return summaries;
+}
+
 export default function AttendanceModule() {
-  const [devices, setDevices] = useState<BiometricDevice[]>([]);
+  const [devices, setDevices] = useState<BiometricDevice[]>(() => loadDevicesFromStorage());
   const [scanning, setScanning] = useState(false);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>("");
   const [selectedDevice, setSelectedDevice] = useState<BiometricDevice | null>(null);
   const [attendanceData, setAttendanceData] = useState<AttendanceRecord[]>([]);
   const [loading, setLoading] = useState(false);
-  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<string>("");
   const scanCancelledRef = useRef<boolean>(false);
   
+  // Connected device info
+  const [connectedDeviceInfo, setConnectedDeviceInfo] = useState<DeviceInfo | null>(null);
+  
+  // View state: "raw" or "summary"
+  const [viewMode, setViewMode] = useState<"raw" | "summary">("summary");
+  
+  // Search and filter state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
+  const [summaryPage, setSummaryPage] = useState(1);
   
-  // Manual connection state
-  const [manualIp, setManualIp] = useState<string>("192.168.1.201");
-  const [manualPort, setManualPort] = useState<string>("4370");
-  const [connecting, setConnecting] = useState(false);
+  // Save devices to localStorage whenever they change
+  useEffect(() => {
+    saveDevicesToStorage(devices);
+  }, [devices]);
   
-  // Paginated data - only compute what we need to display
+  // Reset pagination when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+    setSummaryPage(1);
+  }, [searchQuery, dateFrom, dateTo]);
+  
+  // Calculate summary from raw data
+  const dailySummary = useMemo(() => {
+    return calculateDailySummary(attendanceData);
+  }, [attendanceData]);
+  
+  // Filter raw data based on search and date
+  const filteredRawData = useMemo(() => {
+    const filtered = attendanceData.filter(record => {
+      // Search filter (by name or user_id)
+      const matchesSearch = searchQuery === "" || 
+        record.user_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        record.user_id.toString().includes(searchQuery);
+      
+      // Date filter
+      const matchesDateFrom = dateFrom === "" || record.date >= dateFrom;
+      const matchesDateTo = dateTo === "" || record.date <= dateTo;
+      
+      return matchesSearch && matchesDateFrom && matchesDateTo;
+    });
+    
+    // Sort by latest date first, then by time (descending)
+    return filtered.sort((a, b) => {
+      const dateCompare = b.date.localeCompare(a.date);
+      if (dateCompare !== 0) return dateCompare;
+      return b.time.localeCompare(a.time);
+    });
+  }, [attendanceData, searchQuery, dateFrom, dateTo]);
+  
+  // Filter summary data based on search and date
+  const filteredSummary = useMemo(() => {
+    return dailySummary.filter(record => {
+      // Search filter (by name or user_id)
+      const matchesSearch = searchQuery === "" || 
+        record.user_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        record.user_id.toString().includes(searchQuery);
+      
+      // Date filter
+      const matchesDateFrom = dateFrom === "" || record.date >= dateFrom;
+      const matchesDateTo = dateTo === "" || record.date <= dateTo;
+      
+      return matchesSearch && matchesDateFrom && matchesDateTo;
+    });
+  }, [dailySummary, searchQuery, dateFrom, dateTo]);
+  
+  // Paginated raw data (from filtered)
   const paginatedData = useMemo(() => {
     const startIndex = (currentPage - 1) * RECORDS_PER_PAGE;
     const endIndex = startIndex + RECORDS_PER_PAGE;
-    return attendanceData.slice(startIndex, endIndex);
-  }, [attendanceData, currentPage]);
+    return filteredRawData.slice(startIndex, endIndex);
+  }, [filteredRawData, currentPage]);
   
-  const totalPages = Math.ceil(attendanceData.length / RECORDS_PER_PAGE);
+  // Paginated summary data (from filtered)
+  const paginatedSummary = useMemo(() => {
+    const startIndex = (summaryPage - 1) * RECORDS_PER_PAGE;
+    const endIndex = startIndex + RECORDS_PER_PAGE;
+    return filteredSummary.slice(startIndex, endIndex);
+  }, [filteredSummary, summaryPage]);
+  
+  const totalPages = Math.ceil(filteredRawData.length / RECORDS_PER_PAGE);
+  const totalSummaryPages = Math.ceil(filteredSummary.length / RECORDS_PER_PAGE);
+  
+  // Calculate date range from attendance data
+  const dateRange = useMemo(() => {
+    if (attendanceData.length === 0) return null;
+    
+    const dates = attendanceData.map(r => r.date).filter(d => d);
+    if (dates.length === 0) return null;
+    
+    const sortedDates = [...new Set(dates)].sort();
+    return {
+      earliest: sortedDates[0],
+      latest: sortedDates[sortedDates.length - 1],
+      totalDays: sortedDates.length
+    };
+  }, [attendanceData]);
+  
+  // Clear filters
+  const clearFilters = () => {
+    setSearchQuery("");
+    setDateFrom("");
+    setDateTo("");
+  };
 
   const scanNetwork = async (): Promise<void> => {
     setScanning(true);
@@ -85,8 +297,31 @@ export default function AttendanceModule() {
       const result = await safeInvoke<BiometricDevice[]>("scan_for_devices");
       
       // Only update if scan wasn't cancelled
-      if (!scanCancelledRef.current) {
-        setDevices(result);
+      if (!scanCancelledRef.current && result.length > 0) {
+        // Merge with existing devices - update existing ones with new info, add new ones
+        setDevices(prev => {
+          const existingMap = new Map(prev.map(d => [d.ip, d]));
+          
+          // Update existing devices with new info from scan
+          for (const scanned of result) {
+            const existing = existingMap.get(scanned.ip);
+            if (existing) {
+              // Update with new device info (keep last_synced from existing)
+              existingMap.set(scanned.ip, {
+                ...existing,
+                device_name: scanned.device_name || existing.device_name,
+                firmware_version: scanned.firmware_version || existing.firmware_version,
+                serial_number: scanned.serial_number || existing.serial_number,
+                open_ports: scanned.open_ports,
+              });
+            } else {
+              // Add new device
+              existingMap.set(scanned.ip, scanned);
+            }
+          }
+          
+          return Array.from(existingMap.values());
+        });
       }
     } catch (err: unknown) {
       // Only show error if scan wasn't cancelled
@@ -110,90 +345,68 @@ export default function AttendanceModule() {
     setScanning(false);
     setError(null);
   };
+  
+  // Remove a device from the list
+  const removeDevice = (ip: string): void => {
+    setDevices(prev => prev.filter(d => d.ip !== ip));
+    if (selectedDevice?.ip === ip) {
+      setSelectedDevice(null);
+      setAttendanceData([]);
+    }
+  };
+  
+  // Select a device
+  const selectDevice = (device: BiometricDevice): void => {
+    setSelectedDevice(device);
+    setAttendanceData([]); // Clear previous data
+    setError(null);
+  };
 
-  // Manual connection function (like Python script)
-  const connectManually = async (): Promise<void> => {
-    if (!manualIp.trim()) {
-      setError("Please enter a valid IP address");
+  // Sync (fetch attendance) from selected device
+  const syncDevice = async (): Promise<void> => {
+    if (!selectedDevice) {
+      setError("Please select a device first");
       return;
     }
     
-    const port = parseInt(manualPort) || 4370;
-    
-    setConnecting(true);
     setLoading(true);
     setError(null);
-    setAttendanceData([]);
     setCurrentPage(1);
+    setSummaryPage(1);
+    setConnectedDeviceInfo(null);
     setLoadingProgress("Connecting to device...");
     
-    // Create a virtual device for display
-    const virtualDevice: BiometricDevice = {
-      ip: manualIp.trim(),
-      mac: "Manual Connection",
-      open_ports: [port],
-    };
-    setSelectedDevice(virtualDevice);
-    
-    try {
-      console.log(`🔌 Connecting to ${manualIp}:${port}...`);
-      setLoadingProgress("Fetching attendance data (this may take 30-60 seconds for large datasets)...");
-      
-      const result = await safeInvoke<AttendanceRecord[]>("fetch_attendance", {
-        ip: manualIp.trim(),
-        port: port,
-      });
-      
-      console.log(`✅ Received ${result.length} attendance records`);
-      setLoadingProgress(`Processing ${result.length} records...`);
-      
-      // Small delay to let UI update
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      setAttendanceData(result);
-      setLoadingProgress("");
-      
-      // Add to devices list if not already there
-      if (!devices.some(d => d.ip === manualIp.trim())) {
-        setDevices(prev => [...prev, virtualDevice]);
-      }
-    } catch (err: unknown) {
-      const errorMessage: string = err instanceof Error 
-        ? err.message 
-        : typeof err === 'string' 
-        ? err 
-        : 'Unknown error occurred';
-      setError(errorMessage);
-      console.error("Manual connection error:", err);
-    } finally {
-      setConnecting(false);
-      setLoading(false);
-      setLoadingProgress("");
-    }
-  };
-
-  const fetchAttendance = async (device: BiometricDevice): Promise<void> => {
-    setLoading(true);
-    setError(null);
-    setSelectedDevice(device);
-    setCurrentPage(1);
-    setLoadingProgress("Connecting to device...");
-    
-    const port: number = device.open_ports.includes(4370) 
+    const port: number = selectedDevice.open_ports.includes(4370) 
       ? 4370 
-      : device.open_ports[0] ?? 4370;
+      : selectedDevice.open_ports[0] ?? 4370;
     
     try {
       setLoadingProgress("Fetching attendance data (this may take 30-60 seconds for large datasets)...");
-      const result = await safeInvoke<AttendanceRecord[]>("fetch_attendance", {
-        ip: device.ip,
+      const result = await safeInvoke<AttendanceResponse>("fetch_attendance", {
+        ip: selectedDevice.ip,
         port: port,
       });
       
-      setLoadingProgress(`Processing ${result.length} records...`);
+      // Store device info
+      setConnectedDeviceInfo(result.device_info);
+      
+      // Update device in list with device info
+      setDevices(prev => prev.map(d => 
+        d.ip === selectedDevice.ip 
+          ? {
+              ...d,
+              device_name: result.device_info.device_name || d.device_name,
+              firmware_version: result.device_info.firmware_version || d.firmware_version,
+              serial_number: result.device_info.serial_number || d.serial_number,
+              last_synced: new Date().toISOString(),
+            }
+          : d
+      ));
+      
+      setLoadingProgress(`Processing ${result.records.length} records...`);
       await new Promise(resolve => setTimeout(resolve, 100));
       
-      setAttendanceData(result);
+      setAttendanceData(result.records);
     } catch (err: unknown) {
       const errorMessage: string = err instanceof Error 
         ? err.message 
@@ -203,60 +416,23 @@ export default function AttendanceModule() {
       setError(errorMessage);
       console.error("Fetch error:", err);
       setAttendanceData([]);
+      setConnectedDeviceInfo(null);
     } finally {
       setLoading(false);
       setLoadingProgress("");
     }
   };
 
-  const handleDeviceSelect = (deviceId: string): void => {
-    setSelectedDeviceId(deviceId);
-    const device = devices.find((d, idx) => `${d.ip}-${idx}` === deviceId);
-    setSelectedDevice(device || null);
-    setAttendanceData([]); // Clear previous attendance data when selecting new device
-  };
-
-  const handleSync = async (): Promise<void> => {
-    if (!selectedDevice) {
-      setError("Please select a device first");
-      return;
-    }
-
-    setSyncing(true);
-    setError(null);
-    
-    try {
-      // TODO: Implement sync functionality
-      // This will be implemented later based on user requirements
-      console.log("Syncing device:", selectedDevice);
-      
-      // Placeholder - will be replaced with actual sync logic
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      
-      setError("Sync functionality will be implemented soon");
-    } catch (err: unknown) {
-      const errorMessage: string = err instanceof Error 
-        ? err.message 
-        : typeof err === 'string' 
-        ? err 
-        : 'Unknown error occurred';
-      setError(errorMessage);
-      console.error("Sync error:", err);
-    } finally {
-      setSyncing(false);
-    }
-  };
-
-  const exportAttendanceToCSV = (): void => {
+  // Export raw attendance data to CSV
+  const exportRawToCSV = (): void => {
     if (attendanceData.length === 0) return;
 
-    const headers = ["User ID", "User Name", "Date", "Time", "Event", "Status", "Punch", "Timestamp"];
+    const headers = ["User ID", "User Name", "Date", "Time", "Status", "Punch", "Timestamp"];
     const rows = attendanceData.map((record) => [
       record.user_id.toString(),
       record.user_name,
       record.date,
       record.time,
-      record.event,
       record.status.toString(),
       record.punch.toString(),
       record.timestamp,
@@ -271,120 +447,81 @@ export default function AttendanceModule() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `attendance_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
+    a.download = `attendance_raw_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
   
+  // Export daily summary to CSV
+  const exportSummaryToCSV = (): void => {
+    if (dailySummary.length === 0) return;
+
+    const headers = ["User ID", "User Name", "Date", "Check In", "Check Out", "Total Punches", "Working Hours"];
+    const rows = dailySummary.map((record) => [
+      record.user_id.toString(),
+      record.user_name,
+      record.date,
+      record.first_punch,
+      record.last_punch,
+      record.total_punches.toString(),
+      record.working_hours,
+    ]);
+
+    const csvContent = [
+      headers.join(","),
+      ...rows.map((row) => row.map((cell) => `"${cell}"`).join(",")),
+    ].join("\n");
+
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `attendance_summary_${selectedDevice?.ip || 'export'}_${new Date().toISOString().split("T")[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
   
-  // Legacy export function for backwards compatibility
-  const exportToCSV = exportAttendanceToCSV;
 
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="bg-white border-b border-gray-200 px-6 py-4">
         <h2 className="text-2xl font-bold text-gray-800">Attendance Management</h2>
-        <p className="text-sm text-gray-600 mt-1">Scan and fetch attendance data from biometric devices</p>
+        <p className="text-sm text-gray-600 mt-1">Manage biometric devices and fetch attendance data</p>
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-auto p-6 space-y-6">
-        {/* Manual Connection Section - Primary Method */}
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <svg className="w-5 h-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-            </svg>
-            <h3 className="text-lg font-semibold text-gray-800">Direct Connection</h3>
-            <span className="px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 rounded-full">Recommended</span>
-          </div>
-          
-          <p className="text-sm text-gray-600 mb-4">
-            Enter your ZKTeco device IP address and port to connect directly. This is faster and more reliable than network scanning.
-          </p>
-          
-          <div className="flex flex-col md:flex-row gap-4">
-            <div className="flex-1">
-              <label htmlFor="manual-ip" className="block text-sm font-medium text-gray-700 mb-1">
-                Device IP Address
-              </label>
-              <input
-                id="manual-ip"
-                type="text"
-                value={manualIp}
-                onChange={(e) => setManualIp(e.target.value)}
-                placeholder="192.168.1.201"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"
-              />
-            </div>
-            <div className="w-32">
-              <label htmlFor="manual-port" className="block text-sm font-medium text-gray-700 mb-1">
-                Port
-              </label>
-              <input
-                id="manual-port"
-                type="text"
-                value={manualPort}
-                onChange={(e) => setManualPort(e.target.value)}
-                placeholder="4370"
-                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"
-              />
-            </div>
-            <div className="flex items-end">
-              <button
-                onClick={connectManually}
-                disabled={connecting || loading}
-                className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-                type="button"
-              >
-                {connecting ? (
-                  <>
-                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                    Connecting...
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                    </svg>
-                    Connect & Fetch
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Device Scanner Section */}
+        
+        {/* Devices Section */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
-              <h3 className="text-lg font-semibold text-gray-800">Network Scanner</h3>
-              <span className="px-2 py-0.5 text-xs font-medium bg-gray-100 text-gray-600 rounded-full">Optional</span>
+              <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+              </svg>
+              <h3 className="text-lg font-semibold text-gray-800">Biometric Devices</h3>
+              <span className="px-2 py-0.5 text-xs font-medium bg-gray-100 text-gray-600 rounded-full">
+                {devices.length} device{devices.length !== 1 ? 's' : ''}
+              </span>
             </div>
             <div className="flex items-center gap-2">
               {scanning ? (
                 <button
                   onClick={stopScan}
-                  className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors flex items-center gap-2"
+                  className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors flex items-center gap-2 text-sm"
                   type="button"
-                  aria-label="Stop scanning"
                 >
                   <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
                     <rect x="6" y="6" width="12" height="12" rx="1" />
                   </svg>
-                  Stop Scanning
+                  Stop
                 </button>
               ) : (
                 <button
                   onClick={scanNetwork}
-                  className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors flex items-center gap-2"
+                  className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors flex items-center gap-2 text-sm"
                   type="button"
-                  aria-label="Scan network for biometric devices"
                 >
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -398,7 +535,7 @@ export default function AttendanceModule() {
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                   </svg>
-                  <span>Scanning network...</span>
+                  <span>Scanning...</span>
                 </div>
               )}
             </div>
@@ -410,154 +547,206 @@ export default function AttendanceModule() {
                 <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
                   <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
                 </svg>
-                <span>Error: {error}</span>
+                <span>{error}</span>
               </div>
             </div>
           )}
 
-          {devices.length > 0 && (
-            <div className="mt-4 pt-4 border-t border-gray-200">
-              <p className="text-sm text-gray-600 font-medium mb-2">
-                Found {devices.length} biometric device(s)
-              </p>
+          {/* Device Cards */}
+          {devices.length === 0 ? (
+            <div className="text-center py-8 text-gray-500">
+              <svg className="w-12 h-12 mx-auto mb-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+              </svg>
+              <p className="font-medium">No devices found</p>
+              <p className="text-sm mt-1">Click "Scan Network" to discover biometric devices</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {devices.map((device) => {
+                const isSelected = selectedDevice?.ip === device.ip;
+                return (
+                  <div
+                    key={device.ip}
+                    onClick={() => selectDevice(device)}
+                    className={`relative p-4 rounded-lg border-2 cursor-pointer transition-all ${
+                      isSelected
+                        ? "border-primary-500 bg-primary-50"
+                        : "border-gray-200 hover:border-gray-300 bg-white"
+                    }`}
+                  >
+                    {/* Remove button */}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeDevice(device.ip);
+                      }}
+                      className="absolute top-2 right-2 p-1 text-gray-400 hover:text-red-500 transition-colors"
+                      title="Remove device"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                    
+                    <div className="flex items-start gap-3">
+                      <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
+                        isSelected ? "bg-primary-500 text-white" : "bg-gray-100 text-gray-600"
+                      }`}>
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+                        </svg>
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="font-semibold text-gray-900">
+                          {device.device_name || device.ip}
+                        </p>
+                        {device.device_name && (
+                          <p className="text-xs text-gray-600">{device.ip}</p>
+                        )}
+                        {device.firmware_version && (
+                          <p className="text-xs text-gray-500">FW: {device.firmware_version}</p>
+                        )}
+                        {device.serial_number && (
+                          <p className="text-xs text-gray-500">S/N: {device.serial_number}</p>
+                        )}
+                        {!device.device_name && !device.serial_number && (
+                          <p className="text-xs text-gray-400 italic">Scanning info...</p>
+                        )}
+                        <p className="text-xs text-gray-400 mt-1">Port: {device.open_ports.join(", ")}</p>
+                      </div>
+                    </div>
+                    
+                    {/* Last synced info */}
+                    {device.last_synced && (
+                      <div className="mt-2 text-xs text-gray-400">
+                        Last sync: {new Date(device.last_synced).toLocaleDateString()} {new Date(device.last_synced).toLocaleTimeString()}
+                      </div>
+                    )}
+                    
+                    {isSelected && (
+                      <div className="mt-2 pt-2 border-t border-primary-200">
+                        <span className="text-xs font-medium text-primary-600">✓ Selected</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          
+          {/* Sync Button */}
+          {selectedDevice && (
+            <div className="mt-4 pt-4 border-t border-gray-200 flex items-center justify-between">
+              <div className="text-sm text-gray-600">
+                Selected: <span className="font-medium text-gray-900">{selectedDevice.ip}</span>
+              </div>
+              <button
+                onClick={syncDevice}
+                disabled={loading}
+                className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                type="button"
+              >
+                {loading ? (
+                  <>
+                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Syncing...
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    Sync Attendance
+                  </>
+                )}
+              </button>
             </div>
           )}
         </div>
 
-        {/* Device Selector & Sync Section */}
-        {devices.length > 0 && (
-          <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
-            <h3 className="text-lg font-semibold text-gray-800 mb-4">Device Management</h3>
-            
-            <div className="flex flex-col md:flex-row gap-4">
-              {/* Device Dropdown */}
-              <div className="flex-1">
-                <label htmlFor="device-select" className="block text-sm font-medium text-gray-700 mb-2">
-                  Select Device
-                </label>
-                <select
-                  id="device-select"
-                  value={selectedDeviceId}
-                  onChange={(e): void => handleDeviceSelect(e.target.value)}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white text-gray-800"
-                >
-                  <option value="">-- Select a device --</option>
-                  {devices.map((device, idx) => {
-                    const deviceId = `${device.ip}-${idx}`;
-                    return (
-                      <option key={deviceId} value={deviceId}>
-                        {device.ip} ({device.mac}) - Ports: {device.open_ports.join(", ")}
-                      </option>
-                    );
-                  })}
-                </select>
-                {selectedDevice && (
-                  <div className="mt-2 p-3 bg-gray-50 rounded-lg">
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 bg-primary-100 rounded-lg flex items-center justify-center">
-                        <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-                        </svg>
-                      </div>
-                      <div className="flex-1">
-                        <p className="text-sm font-medium text-gray-800">IP: {selectedDevice.ip}</p>
-                        <p className="text-xs text-gray-500">MAC: {selectedDevice.mac}</p>
-                      </div>
-                    </div>
-                  </div>
-                )}
+        {/* Connected Device Info */}
+        {connectedDeviceInfo && (
+          <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg border border-green-200 p-4 mb-6">
+            <div className="flex items-start gap-3">
+              <div className="p-2 bg-green-100 rounded-lg">
+                <svg className="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
               </div>
-
-              {/* Sync Button */}
-              <div className="flex items-end">
-                <button
-                  onClick={handleSync}
-                  disabled={!selectedDevice || syncing}
-                  className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-                  type="button"
-                  aria-label="Sync device"
-                >
-                  {syncing ? (
-                    <>
-                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                      </svg>
-                      Syncing...
-                    </>
-                  ) : (
-                    <>
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                      </svg>
-                      Sync
-                    </>
+              <div className="flex-1">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="text-sm font-semibold text-green-800">✅ Connected to device</h4>
+                  {dateRange && (
+                    <span className="inline-flex items-center px-3 py-1 rounded-full bg-blue-100 text-blue-800 text-sm font-semibold">
+                      📅 Latest: {dateRange.latest}
+                    </span>
                   )}
-                </button>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                  <div className="flex items-center gap-2">
+                    <span className="text-green-600">📟</span>
+                    <span className="text-gray-600">Device Name:</span>
+                    <span className="font-medium text-gray-800">{connectedDeviceInfo.device_name || "Unknown"}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-green-600">📟</span>
+                    <span className="text-gray-600">Firmware:</span>
+                    <span className="font-medium text-gray-800">{connectedDeviceInfo.firmware_version || "Unknown"}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-green-600">📟</span>
+                    <span className="text-gray-600">Serial:</span>
+                    <span className="font-medium text-gray-800">{connectedDeviceInfo.serial_number || "Unknown"}</span>
+                  </div>
+                  {connectedDeviceInfo.platform && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-green-600">🖥️</span>
+                      <span className="text-gray-600">Platform:</span>
+                      <span className="font-medium text-gray-800">{connectedDeviceInfo.platform}</span>
+                    </div>
+                  )}
+                  {connectedDeviceInfo.mac_address && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-green-600">🔗</span>
+                      <span className="text-gray-600">MAC:</span>
+                      <span className="font-medium text-gray-800">{connectedDeviceInfo.mac_address}</span>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
-
-            {/* Fetch Attendance Button */}
-            {selectedDevice && (
-              <div className="mt-4 pt-4 border-t border-gray-200">
-                <button
-                  onClick={(): void => {
-                    if (selectedDevice) {
-                      void fetchAttendance(selectedDevice);
-                    }
-                  }}
-                  disabled={loading}
-                  className="w-full md:w-auto px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
-                  type="button"
-                  aria-label="Fetch attendance from selected device"
-                >
-                  {loading ? (
-                    <>
-                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                      </svg>
-                      Loading...
-                    </>
-                  ) : (
-                    <>
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                      </svg>
-                      Fetch Attendance
-                    </>
-                  )}
-                </button>
-              </div>
-            )}
           </div>
         )}
 
         {/* Attendance Data Section */}
-        {selectedDevice && (
+        {(selectedDevice || attendanceData.length > 0) && (
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h3 className="text-lg font-semibold text-gray-800">Attendance Data</h3>
                 {selectedDevice && (
-                  <p className="text-sm text-gray-600 mt-1">
-                    Device: {selectedDevice.ip} | Records: {attendanceData.length}
-                  </p>
+                  <div className="text-sm text-gray-600 mt-1 space-y-1">
+                    <p>
+                      Device: {selectedDevice.ip} | Raw Records: {attendanceData.length.toLocaleString()} | Daily Summary: {dailySummary.length.toLocaleString()}
+                    </p>
+                    {dateRange && (
+                      <p className="flex items-center gap-2">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded bg-blue-100 text-blue-800 text-xs font-medium">
+                          📅 Latest: {dateRange.latest}
+                        </span>
+                        <span className="text-gray-400">|</span>
+                        <span className="text-xs text-gray-500">
+                          Earliest: {dateRange.earliest} • {dateRange.totalDays} days
+                        </span>
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
-              {attendanceData.length > 0 && (
-                <button
-                  onClick={exportToCSV}
-                  className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors flex items-center gap-2"
-                  type="button"
-                  aria-label="Export attendance data to CSV"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                  Export to CSV
-                </button>
-              )}
             </div>
 
             {loading ? (
@@ -573,165 +762,230 @@ export default function AttendanceModule() {
               </div>
             ) : attendanceData.length > 0 ? (
               <>
-                {/* Download Buttons Section */}
-                <div className="mb-4 p-4 bg-gray-50 rounded-lg flex flex-wrap gap-3 items-center">
+                {/* Tab Navigation */}
+                <div className="mb-4 border-b border-gray-200">
+                  <nav className="flex gap-4">
+                    <button
+                      onClick={() => { setViewMode("summary"); setSummaryPage(1); }}
+                      className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                        viewMode === "summary"
+                          ? "border-primary-600 text-primary-600"
+                          : "border-transparent text-gray-500 hover:text-gray-700"
+                      }`}
+                    >
+                      Daily Summary ({filteredSummary.length.toLocaleString()})
+                    </button>
+                    <button
+                      onClick={() => { setViewMode("raw"); setCurrentPage(1); }}
+                      className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+                        viewMode === "raw"
+                          ? "border-primary-600 text-primary-600"
+                          : "border-transparent text-gray-500 hover:text-gray-700"
+                      }`}
+                    >
+                      Raw Data ({filteredRawData.length.toLocaleString()})
+                    </button>
+                  </nav>
+                </div>
+                
+                {/* Search and Filter Section */}
+                <div className="mb-4 p-4 bg-gray-50 rounded-lg">
+                  <div className="flex flex-wrap gap-4 items-end">
+                    {/* Search Employee */}
+                    <div className="flex-1 min-w-[200px]">
+                      <label className="block text-xs font-medium text-gray-600 mb-1">Search Employee</label>
+                      <div className="relative">
+                        <input
+                          type="text"
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          placeholder="Name or ID..."
+                          className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        />
+                        <svg className="absolute left-3 top-2.5 w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                        </svg>
+                      </div>
+                    </div>
+                    
+                    {/* Date From */}
+                    <div className="w-40">
+                      <label className="block text-xs font-medium text-gray-600 mb-1">From Date</label>
+                      <input
+                        type="date"
+                        value={dateFrom}
+                        onChange={(e) => setDateFrom(e.target.value)}
+                        className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                      />
+                    </div>
+                    
+                    {/* Date To */}
+                    <div className="w-40">
+                      <label className="block text-xs font-medium text-gray-600 mb-1">To Date</label>
+                      <input
+                        type="date"
+                        value={dateTo}
+                        onChange={(e) => setDateTo(e.target.value)}
+                        className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                      />
+                    </div>
+                    
+                    {/* Clear Filters */}
+                    {(searchQuery || dateFrom || dateTo) && (
+                      <button
+                        onClick={clearFilters}
+                        className="px-3 py-2 text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-200 rounded-lg transition-colors flex items-center gap-1"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                  
+                  {/* Filter Summary */}
+                  {(searchQuery || dateFrom || dateTo) && (
+                    <div className="mt-3 pt-3 border-t border-gray-200 text-xs text-gray-500">
+                      Showing {viewMode === "summary" ? filteredSummary.length.toLocaleString() : filteredRawData.length.toLocaleString()} of {viewMode === "summary" ? dailySummary.length.toLocaleString() : attendanceData.length.toLocaleString()} records
+                      {searchQuery && <span className="ml-2">• Search: "{searchQuery}"</span>}
+                      {dateFrom && <span className="ml-2">• From: {dateFrom}</span>}
+                      {dateTo && <span className="ml-2">• To: {dateTo}</span>}
+                    </div>
+                  )}
+                </div>
+                
+                {/* Download Buttons */}
+                <div className="mb-4 p-4 bg-white border border-gray-200 rounded-lg flex flex-wrap gap-3 items-center">
                   <span className="text-sm font-medium text-gray-700">Download:</span>
                   <button
-                    onClick={exportAttendanceToCSV}
+                    onClick={exportSummaryToCSV}
+                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2 text-sm"
+                    type="button"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    Summary CSV
+                  </button>
+                  <button
+                    onClick={exportRawToCSV}
                     className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors flex items-center gap-2 text-sm"
                     type="button"
                   >
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                     </svg>
-                    Attendance CSV ({attendanceData.length.toLocaleString()} records)
+                    Raw Data CSV
                   </button>
-                  <span className="text-xs text-gray-500">
-                    Showing {((currentPage - 1) * RECORDS_PER_PAGE) + 1} - {Math.min(currentPage * RECORDS_PER_PAGE, attendanceData.length)} of {attendanceData.length.toLocaleString()}
-                  </span>
                 </div>
                 
-                {/* Pagination Controls - Top */}
-                {totalPages > 1 && (
-                  <div className="mb-4 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => setCurrentPage(1)}
-                        disabled={currentPage === 1}
-                        className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        First
-                      </button>
-                      <button
-                        onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                        disabled={currentPage === 1}
-                        className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        Previous
-                      </button>
-                      <span className="px-3 py-1 text-sm text-gray-700">
-                        Page {currentPage} of {totalPages}
-                      </span>
-                      <button
-                        onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                        disabled={currentPage === totalPages}
-                        className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        Next
-                      </button>
-                      <button
-                        onClick={() => setCurrentPage(totalPages)}
-                        disabled={currentPage === totalPages}
-                        className="px-3 py-1 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        Last
-                      </button>
+                {/* SUMMARY VIEW */}
+                {viewMode === "summary" && (
+                  <>
+                    <div className="mb-2 text-xs text-gray-500">
+                      Showing {filteredSummary.length > 0 ? ((summaryPage - 1) * RECORDS_PER_PAGE) + 1 : 0} - {Math.min(summaryPage * RECORDS_PER_PAGE, filteredSummary.length)} of {filteredSummary.length.toLocaleString()} daily records
                     </div>
-                    <div className="flex items-center gap-2">
-                      <label className="text-sm text-gray-600">Go to page:</label>
-                      <input
-                        type="number"
-                        min={1}
-                        max={totalPages}
-                        value={currentPage}
-                        onChange={(e) => {
-                          const page = parseInt(e.target.value);
-                          if (page >= 1 && page <= totalPages) {
-                            setCurrentPage(page);
-                          }
-                        }}
-                        className="w-20 px-2 py-1 text-sm border border-gray-300 rounded"
-                      />
+                    
+                    {/* Pagination */}
+                    {totalSummaryPages > 1 && (
+                      <div className="mb-4 flex items-center gap-2">
+                        <button onClick={() => setSummaryPage(1)} disabled={summaryPage === 1} className="px-3 py-1 text-sm border rounded disabled:opacity-50">First</button>
+                        <button onClick={() => setSummaryPage(p => Math.max(1, p - 1))} disabled={summaryPage === 1} className="px-3 py-1 text-sm border rounded disabled:opacity-50">Prev</button>
+                        <span className="px-3 py-1 text-sm">Page {summaryPage} of {totalSummaryPages}</span>
+                        <button onClick={() => setSummaryPage(p => Math.min(totalSummaryPages, p + 1))} disabled={summaryPage === totalSummaryPages} className="px-3 py-1 text-sm border rounded disabled:opacity-50">Next</button>
+                        <button onClick={() => setSummaryPage(totalSummaryPages)} disabled={summaryPage === totalSummaryPages} className="px-3 py-1 text-sm border rounded disabled:opacity-50">Last</button>
+                      </div>
+                    )}
+                    
+                    <div className="overflow-x-auto border border-gray-200 rounded-lg">
+                      <table className="min-w-full divide-y divide-gray-200">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">#</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">User ID</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">User Name</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Check In</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Check Out</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Punches</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Hours</th>
+                          </tr>
+                        </thead>
+                        <tbody className="bg-white divide-y divide-gray-200">
+                          {paginatedSummary.map((record, idx) => (
+                            <tr key={idx} className="hover:bg-gray-50">
+                              <td className="px-4 py-3 text-sm text-gray-400">{((summaryPage - 1) * RECORDS_PER_PAGE) + idx + 1}</td>
+                              <td className="px-4 py-3 text-sm text-gray-900">{record.user_id}</td>
+                              <td className="px-4 py-3 text-sm text-gray-900">{record.user_name}</td>
+                              <td className="px-4 py-3 text-sm text-gray-500">{record.date}</td>
+                              <td className="px-4 py-3 text-sm">
+                                <span className="px-2 py-1 text-xs font-medium rounded-full bg-green-100 text-green-800">
+                                  {record.first_punch}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-sm">
+                                <span className="px-2 py-1 text-xs font-medium rounded-full bg-red-100 text-red-800">
+                                  {record.last_punch}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-sm text-gray-500">{record.total_punches}</td>
+                              <td className="px-4 py-3 text-sm font-medium text-gray-900">{record.working_hours}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
-                  </div>
+                  </>
                 )}
                 
-                <div className="overflow-x-auto border border-gray-200 rounded-lg">
-                  <table className="min-w-full divide-y divide-gray-200">
-                    <thead className="bg-gray-50">
-                      <tr>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          #
-                        </th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          User ID
-                        </th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          User Name
-                        </th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          Date
-                        </th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          Time
-                        </th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          Event
-                        </th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          Status
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody className="bg-white divide-y divide-gray-200">
-                      {paginatedData.map((record, idx) => (
-                        <tr key={idx} className="hover:bg-gray-50 transition-colors">
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
-                            {((currentPage - 1) * RECORDS_PER_PAGE) + idx + 1}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                            {record.user_id}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                            {record.user_name}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                            {record.date}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                            {record.time}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap">
-                            <span className={`px-2 py-1 text-xs font-medium rounded-full ${
-                              record.event === "Check In" 
-                                ? "bg-green-100 text-green-800"
-                                : record.event === "Check Out"
-                                ? "bg-red-100 text-red-800"
-                                : "bg-gray-100 text-gray-800"
-                            }`}>
-                              {record.event}
-                            </span>
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                            {record.status}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                
-                {/* Pagination Controls - Bottom */}
-                {totalPages > 1 && (
-                  <div className="mt-4 flex items-center justify-center gap-2">
-                    <button
-                      onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                      disabled={currentPage === 1}
-                      className="px-4 py-2 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      ← Previous
-                    </button>
-                    <span className="px-4 py-2 text-sm text-gray-600">
-                      Page {currentPage} of {totalPages}
-                    </span>
-                    <button
-                      onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                      disabled={currentPage === totalPages}
-                      className="px-4 py-2 text-sm bg-gray-100 text-gray-700 rounded hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      Next →
-                    </button>
-                  </div>
+                {/* RAW DATA VIEW */}
+                {viewMode === "raw" && (
+                  <>
+                    <div className="mb-2 text-xs text-gray-500">
+                      Showing {filteredRawData.length > 0 ? ((currentPage - 1) * RECORDS_PER_PAGE) + 1 : 0} - {Math.min(currentPage * RECORDS_PER_PAGE, filteredRawData.length)} of {filteredRawData.length.toLocaleString()} raw records
+                    </div>
+                    
+                    {/* Pagination */}
+                    {totalPages > 1 && (
+                      <div className="mb-4 flex items-center gap-2">
+                        <button onClick={() => setCurrentPage(1)} disabled={currentPage === 1} className="px-3 py-1 text-sm border rounded disabled:opacity-50">First</button>
+                        <button onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1} className="px-3 py-1 text-sm border rounded disabled:opacity-50">Prev</button>
+                        <span className="px-3 py-1 text-sm">Page {currentPage} of {totalPages}</span>
+                        <button onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages} className="px-3 py-1 text-sm border rounded disabled:opacity-50">Next</button>
+                        <button onClick={() => setCurrentPage(totalPages)} disabled={currentPage === totalPages} className="px-3 py-1 text-sm border rounded disabled:opacity-50">Last</button>
+                      </div>
+                    )}
+                    
+                    <div className="overflow-x-auto border border-gray-200 rounded-lg">
+                      <table className="min-w-full divide-y divide-gray-200">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">#</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">User ID</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">User Name</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Time</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Punch</th>
+                          </tr>
+                        </thead>
+                        <tbody className="bg-white divide-y divide-gray-200">
+                          {paginatedData.map((record, idx) => (
+                            <tr key={idx} className="hover:bg-gray-50">
+                              <td className="px-4 py-3 text-sm text-gray-400">{((currentPage - 1) * RECORDS_PER_PAGE) + idx + 1}</td>
+                              <td className="px-4 py-3 text-sm text-gray-900">{record.user_id}</td>
+                              <td className="px-4 py-3 text-sm text-gray-900">{record.user_name}</td>
+                              <td className="px-4 py-3 text-sm text-gray-500">{record.date}</td>
+                              <td className="px-4 py-3 text-sm text-gray-500">{record.time}</td>
+                              <td className="px-4 py-3 text-sm text-gray-500">{record.status}</td>
+                              <td className="px-4 py-3 text-sm text-gray-500">{record.punch}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
                 )}
               </>
             ) : (

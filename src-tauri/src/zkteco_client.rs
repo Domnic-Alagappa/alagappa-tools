@@ -10,12 +10,26 @@ use log::{debug, info, warn};
 pub struct AttendanceRecord {
     pub user_id: u32,
     pub user_name: String,
-    pub timestamp: String,
-    pub status: u8,
-    pub punch: u8,
-    pub date: String,
-    pub time: String,
-    pub event: String,
+    pub timestamp: String,  // ISO format for sorting
+    pub status: u8,         // Raw status from device
+    pub punch: u8,          // Raw punch from device
+    pub date: String,       // YYYY-MM-DD
+    pub time: String,       // HH:MM:SS
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub device_name: String,
+    pub firmware_version: String,
+    pub serial_number: String,
+    pub platform: String,
+    pub mac_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttendanceResponse {
+    pub device_info: DeviceInfo,
+    pub records: Vec<AttendanceRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +61,9 @@ const CMD_AUTH: u16 = 1102;
 const CMD_GET_FREE_SIZES: u16 = 50;
 const CMD_DATA_WRRQ: u16 = 1503;  // Buffered data request
 const CMD_DATA_RDY: u16 = 1504;   // Read chunk
+const CMD_OPTIONS_RRQ: u16 = 11;  // Get option value
+const CMD_VERSION: u16 = 1100;    // Get firmware version
+const CMD_SERIALNUMBER: u16 = 1101; // Get serial number (alternative)
 
 // TCP header constants (from pyzk)
 const MACHINE_PREPARE_DATA_1: u16 = 20560; // 0x5050
@@ -202,7 +219,6 @@ impl ZKClient {
         
         let response_data = if data.len() > 8 { data[8..].to_vec() } else { Vec::new() };
         
-        debug!("Response: cmd={}, data_len={}", response_cmd, response_data.len());
         
         Ok((response_cmd, response_data))
     }
@@ -285,7 +301,6 @@ impl ZKClient {
         let (cmd, data) = self.send_command(CMD_CONNECT, &[])?;
         
         if cmd == CMD_ACK_UNAUTH {
-            debug!("Device requires authentication");
             let commkey = Self::make_commkey(0, self.session_id);
             let (auth_cmd, _) = self.send_command(CMD_AUTH, &commkey)?;
             
@@ -324,6 +339,95 @@ impl ZKClient {
         } else {
             warn!("Could not read device sizes");
             Ok((0, 0, 0))
+        }
+    }
+    
+    /// Get a device option value
+    fn get_option(&mut self, option: &str) -> Result<String, String> {
+        let mut cmd_data = option.as_bytes().to_vec();
+        cmd_data.push(0x00); // null terminate
+        
+        let (cmd, data) = self.send_command(CMD_OPTIONS_RRQ, &cmd_data)?;
+        
+        if cmd == CMD_ACK_OK && !data.is_empty() {
+            // Response format: "option=value\0" - extract value after '='
+            let response = String::from_utf8_lossy(&data);
+            let response = response.trim_end_matches('\0');
+            
+            if let Some(pos) = response.find('=') {
+                let value = response[pos + 1..].to_string();
+                Ok(value)
+            } else {
+                Ok(response.to_string())
+            }
+        } else {
+            Ok(String::new())
+        }
+    }
+    
+    /// Get device information (name, firmware, serial, etc.)
+    /// Get firmware version using direct command
+    fn get_firmware_version(&mut self) -> String {
+        // Try direct version command first (CMD_VERSION = 1100)
+        if let Ok((cmd, data)) = self.send_command(CMD_VERSION, &[]) {
+            if cmd == CMD_ACK_OK && !data.is_empty() {
+                let version = String::from_utf8_lossy(&data).trim_end_matches('\0').to_string();
+                if !version.is_empty() {
+                    return version;
+                }
+            }
+        }
+        
+        // Fallback to options
+        let options = ["~ZKFPVersion", "FWVersion", "~FWVersion", "ZKFPVersion"];
+        for opt in options {
+            let v = self.get_option(opt).unwrap_or_default();
+            if !v.is_empty() { return v; }
+        }
+        String::new()
+    }
+    
+    /// Get serial number using direct command or options
+    fn get_serial_number(&mut self) -> String {
+        // Try direct serial number command (CMD_SERIALNUMBER = 1101)
+        if let Ok((cmd, data)) = self.send_command(CMD_SERIALNUMBER, &[]) {
+            if cmd == CMD_ACK_OK && !data.is_empty() {
+                let serial = String::from_utf8_lossy(&data).trim_end_matches('\0').to_string();
+                if !serial.is_empty() {
+                    return serial;
+                }
+            }
+        }
+        
+        // Fallback to options
+        let options = ["~SerialNumber", "SerialNumber", "SN"];
+        for opt in options {
+            let v = self.get_option(opt).unwrap_or_default();
+            if !v.is_empty() { return v; }
+        }
+        String::new()
+    }
+    
+    fn get_device_info(&mut self) -> DeviceInfo {
+        let device_name = self.get_option("~DeviceName").unwrap_or_default();
+        let firmware_version = self.get_firmware_version();
+        let serial_number = self.get_serial_number();
+        let platform = self.get_option("~Platform").unwrap_or_default();
+        let mac_address = self.get_option("MAC").unwrap_or_default();
+        
+        // Log device info on single line
+        info!("📟 {} | {} | S/N: {}", 
+            if device_name.is_empty() { "Unknown" } else { &device_name },
+            if firmware_version.is_empty() { "-" } else { &firmware_version },
+            if serial_number.is_empty() { "-" } else { &serial_number }
+        );
+        
+        DeviceInfo {
+            device_name,
+            firmware_version,
+            serial_number,
+            platform,
+            mac_address,
         }
     }
     
@@ -825,7 +929,6 @@ impl ZKClient {
                         .unwrap_or_else(|| format!("Unknown (ID: {})", uid));
                     
                     let dt = Self::decode_time(timestamp);
-                    let event = Self::status_to_event(status);
                     
                     records.push(AttendanceRecord {
                         user_id: uid as u32,
@@ -835,7 +938,6 @@ impl ZKClient {
                         punch,
                         date: dt.format("%Y-%m-%d").to_string(),
                         time: dt.format("%H:%M:%S").to_string(),
-                        event: event.to_string(),
                     });
                     
                     offset += 8;
@@ -862,7 +964,6 @@ impl ZKClient {
                         .unwrap_or_else(|| format!("Unknown (ID: {})", user_id));
                     
                     let dt = Self::decode_time(timestamp);
-                    let event = Self::status_to_event(status);
                     
                     records.push(AttendanceRecord {
                         user_id,
@@ -872,7 +973,6 @@ impl ZKClient {
                         punch,
                         date: dt.format("%Y-%m-%d").to_string(),
                         time: dt.format("%H:%M:%S").to_string(),
-                        event: event.to_string(),
                     });
                     
                     offset += 16;
@@ -910,8 +1010,6 @@ impl ZKClient {
                         };
                         
                         let dt = Self::decode_time(timestamp);
-                        let event = Self::status_to_event(status);
-                        
                         let final_user_id: u32 = user_id_str.parse().unwrap_or(uid as u32);
                         
                         records.push(AttendanceRecord {
@@ -922,7 +1020,6 @@ impl ZKClient {
                             punch,
                             date: dt.format("%Y-%m-%d").to_string(),
                             time: dt.format("%H:%M:%S").to_string(),
-                            event: event.to_string(),
                         });
                     }
                     
@@ -933,18 +1030,6 @@ impl ZKClient {
         
         info!("Parsed {} attendance records", records.len());
         Ok(records)
-    }
-    
-    fn status_to_event(status: u8) -> &'static str {
-        match status {
-            0 => "Check In",
-            1 => "Check Out",
-            2 => "Break Out",
-            3 => "Break In",
-            4 => "OT In",
-            5 => "OT Out",
-            _ => "Unknown",
-        }
     }
     
     fn disconnect(&mut self) -> Result<(), String> {
@@ -958,11 +1043,14 @@ impl ZKClient {
 pub async fn connect_and_fetch_attendance(
     ip: &str,
     port: u16,
-) -> Result<Vec<AttendanceRecord>, String> {
+) -> Result<AttendanceResponse, String> {
     let ip = ip.to_string();
     
     tokio::task::spawn_blocking(move || {
         let mut client = ZKClient::connect(&ip, port)?;
+        
+        // Get device info first
+        let device_info = client.get_device_info();
         
         if let Err(e) = client.disable_device() {
             warn!("Failed to disable device: {}", e);
@@ -978,8 +1066,50 @@ pub async fn connect_and_fetch_attendance(
         
         client.disconnect()?;
         
-        Ok(records)
+        Ok(AttendanceResponse {
+            device_info,
+            records,
+        })
     })
     .await
     .map_err(|e| format!("Task error: {}", e))?
+}
+
+/// Quick function to get device info without fetching attendance
+/// Used during network scanning
+pub async fn get_device_info_quick(ip: &str, port: u16) -> Option<DeviceInfo> {
+    let ip = ip.to_string();
+    
+    tokio::task::spawn_blocking(move || {
+        // Quick connect with shorter timeout
+        let addr = format!("{}:{}", ip, port);
+        let stream = std::net::TcpStream::connect_timeout(
+            &addr.parse().ok()?,
+            std::time::Duration::from_secs(3)
+        ).ok()?;
+        
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
+        
+        let mut client = ZKClient {
+            stream,
+            session_id: 0,
+            reply_id: USHRT_MAX - 1,
+        };
+        
+        // Try to handshake
+        if client.do_handshake().is_err() {
+            return None;
+        }
+        
+        // Get device info
+        let device_info = client.get_device_info();
+        
+        // Disconnect
+        let _ = client.disconnect();
+        
+        Some(device_info)
+    })
+    .await
+    .ok()?
 }

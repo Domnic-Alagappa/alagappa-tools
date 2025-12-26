@@ -5,12 +5,16 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use std::sync::Arc;
 use log::{info, warn};
+use crate::zkteco_client::get_device_info_quick;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BiometricDevice {
     pub ip: String,
     pub mac: String,
     pub open_ports: Vec<u16>,
+    pub device_name: Option<String>,
+    pub firmware_version: Option<String>,
+    pub serial_number: Option<String>,
 }
 
 // Common ports for biometric/time-attendance devices
@@ -58,34 +62,42 @@ async fn check_biometric_ip(ip: String, semaphore: Arc<Semaphore>) -> Option<Bio
     let _permit = semaphore.acquire().await.ok()?;
     
     // First check the main ZKTeco port (4370)
-    if check_port(&ip, 4370, 300).await {
-        let mut open_ports = vec![4370];
+    let main_port = if check_port(&ip, 4370, 300).await {
+        Some(4370u16)
+    } else if check_port(&ip, 4360, 300).await {
+        Some(4360u16)
+    } else {
+        None
+    };
+    
+    if let Some(port) = main_port {
+        let mut open_ports = vec![port];
         
         // Check other ports
-        for port in OTHER_PORTS {
-            if check_port(&ip, *port, 200).await {
-                open_ports.push(*port);
+        for p in OTHER_PORTS {
+            if check_port(&ip, *p, 200).await {
+                open_ports.push(*p);
             }
         }
         
-        // Check secondary biometric port
-        if check_port(&ip, 4360, 200).await {
+        // Check secondary biometric port if not already found
+        if port != 4360 && check_port(&ip, 4360, 200).await {
             open_ports.push(4360);
         }
+        if port != 4370 && check_port(&ip, 4370, 200).await {
+            open_ports.push(4370);
+        }
+        
+        // Fetch device info
+        let device_info = get_device_info_quick(&ip, port).await;
         
         return Some(BiometricDevice {
             ip,
             mac: "Unknown".to_string(),
             open_ports,
-        });
-    }
-    
-    // Check secondary port 4360
-    if check_port(&ip, 4360, 300).await {
-        return Some(BiometricDevice {
-            ip,
-            mac: "Unknown".to_string(),
-            open_ports: vec![4360],
+            device_name: device_info.as_ref().map(|d| d.device_name.clone()).filter(|s| !s.is_empty()),
+            firmware_version: device_info.as_ref().map(|d| d.firmware_version.clone()).filter(|s| !s.is_empty()),
+            serial_number: device_info.as_ref().map(|d| d.serial_number.clone()).filter(|s| !s.is_empty()),
         });
     }
     
@@ -96,8 +108,7 @@ pub async fn scan_network() -> Result<Vec<BiometricDevice>, String> {
     let local_ip = get_local_ip()?;
     let network = format!("{}/24", local_ip);
     
-    info!("🌐 Scanning network: {}", network);
-    info!("🔍 Looking for ZKTeco devices on port 4370...");
+    info!("🔍 Scanning network: {}", network);
     
     let parts: Vec<u8> = local_ip.octets().to_vec();
     
@@ -122,20 +133,14 @@ pub async fn scan_network() -> Result<Vec<BiometricDevice>, String> {
     
     for handle in handles {
         if let Ok(Some(device)) = handle.await {
-            info!("✅ Found biometric device at {} (ports: {:?})", device.ip, device.open_ports);
             biometric_devices.push(device);
         }
     }
     
-    info!("📋 Scan complete:");
     if !biometric_devices.is_empty() {
-        info!("🎯 Found {} biometric device(s)", biometric_devices.len());
-        for device in &biometric_devices {
-            info!("   {} → ports {:?}", device.ip, device.open_ports);
-        }
+        info!("✅ Found {} device(s)", biometric_devices.len());
     } else {
-        warn!("🚫 No biometric devices found on this network");
-        warn!("   Tip: Use 'Direct Connection' if you know the device IP");
+        warn!("🚫 No biometric devices found");
     }
     
     Ok(biometric_devices)
